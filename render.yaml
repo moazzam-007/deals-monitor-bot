@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: deals-monitor-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:flask_app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: STRING_SESSION
+        sync: false
+      - key: CHANNELS
+        sync: false
+      - key: OUTPUT_CHANNEL_ID
+        sync: false
+      - key: N8N_WEBHOOK_URL
+        sync: false
+      - key: POST_DELAY
+        value: "3"
+      - key: POLLING_INTERVAL
+        value: "600"
+      - key: POLLING_LIMIT
+        value: "5"

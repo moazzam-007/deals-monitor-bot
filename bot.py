@@ -1,5 +1,7 @@
-import os
 import asyncio
+asyncio.set_event_loop(asyncio.new_event_loop())  # Must be first — fixes Gunicorn/Python3.10+ startup
+
+import os
 import logging
 import threading
 from collections import deque

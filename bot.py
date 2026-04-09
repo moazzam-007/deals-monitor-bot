@@ -1,11 +1,8 @@
-import asyncio
-asyncio.set_event_loop(asyncio.new_event_loop())
-
 import os
 import asyncio
 import logging
 import threading
-from typing import Optional
+from collections import deque
 
 import aiohttp
 from flask import Flask, jsonify
@@ -25,22 +22,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# BoundedSet — O(1) lookup + automatic eviction of oldest entries
+# Replaces plain deque (which has O(n) 'in' lookup)
+# ---------------------------------------------------------------------------
+class BoundedSet:
+    """
+    Thread-safe set with a max size.
+    Evicts the oldest entry when full (like deque(maxlen=N)).
+    O(1) lookup, O(1) add.
+    """
+    def __init__(self, maxlen: int):
+        self.maxlen = maxlen
+        self._set: set = set()
+        self._deque: deque = deque()
+
+    def __contains__(self, item) -> bool:
+        return item in self._set
+
+    def add(self, item):
+        if item in self._set:
+            return
+        if len(self._deque) >= self.maxlen:
+            oldest = self._deque.popleft()
+            self._set.discard(oldest)
+        self._deque.append(item)
+        self._set.add(item)
+
+    def __len__(self):
+        return len(self._set)
+
+
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
 flask_app = Flask(__name__)
 url_resolver = URLResolver()
 
-# Per-channel "starting point" — only messages AFTER this ID are processed
-last_message_ids = {}  # {channel_id: last_processed_msg_id}
+# asyncio Queue — ensures messages processed one at a time
+# Prevents concurrent n8n / Wishlink API calls
+_message_queue: asyncio.Queue = None
+_worker_task: asyncio.Task = None  # stored reference — detects silent crashes
 
-# Temp directory for downloaded media
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Layer 1 in-memory duplicate detection
+# O(1) lookup + auto-eviction at 2000 entries
+seen_product_ids = BoundedSet(maxlen=2000)
 
 
 # ---------------------------------------------------------------------------
-# Flask health endpoints (keeps Render alive when pinged)
+# Flask health endpoints (pinged by n8n to keep Render alive)
 # ---------------------------------------------------------------------------
 @flask_app.route("/")
 def home():
@@ -48,131 +79,42 @@ def home():
         "service": "deals-monitor-bot",
         "status": "running",
         "channels_monitored": len(Config.CHANNELS),
+        "queue_size": _message_queue.qsize() if _message_queue else 0,
+        "seen_count": len(seen_product_ids),
     })
 
 
 @flask_app.route("/health")
 def health():
-    if "_bot_thread" in globals() and _bot_thread.is_alive():
+    thread_alive = "_bot_thread" in globals() and _bot_thread.is_alive()
+    if thread_alive:
         return jsonify({"status": "healthy"})
     return jsonify({"status": "unhealthy", "error": "Bot thread is dead"}), 500
 
 
 # ---------------------------------------------------------------------------
-# n8n webhook communication
+# n8n webhook — fire & forget
+# n8n handles: Layer 2 dedup (Sheets), Wishlink API, copyMessage, log
 # ---------------------------------------------------------------------------
-async def call_n8n_webhook(payload: dict) -> Optional[dict]:
-    """
-    POST message data to the n8n webhook.
-    n8n responds synchronously with:
-      { "action": "post" | "skip", "affiliate_links": { original_url: aff_url } }
-    """
+async def fire_n8n_webhook(payload: dict) -> bool:
+    """POST payload to n8n webhook. Returns True on HTTP 200."""
     try:
-        timeout = aiohttp.ClientTimeout(total=60)
+        timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(Config.N8N_WEBHOOK_URL, json=payload) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"n8n response: action={data.get('action')}")
-                    return data
+                    logger.info(
+                        f"✅ n8n webhook fired: {payload.get('product_id')} | "
+                        f"msg {payload.get('message_id')}"
+                    )
+                    return True
                 else:
                     body = await resp.text()
                     logger.error(f"n8n error {resp.status}: {body[:200]}")
-                    return None
+                    return False
     except Exception as e:
         logger.error(f"n8n webhook call failed: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Post to output channel
-# ---------------------------------------------------------------------------
-async def post_to_channel(client: Client, message, affiliate_links: dict):
-    """
-    Download the original media, replace links in caption,
-    and re-post to the output channel.
-    """
-    caption = message.caption or message.text or ""
-
-    # Replace each original URL with its affiliate counterpart
-    for original_url, aff_url in affiliate_links.items():
-        if aff_url and aff_url != original_url:
-            caption = caption.replace(original_url, aff_url)
-
-    try:
-        if message.photo:
-            path = await client.download_media(
-                message,
-                file_name=os.path.join(DOWNLOAD_DIR, f"photo_{message.id}.jpg"),
-            )
-            try:
-                if path:
-                    await client.send_photo(
-                        chat_id=Config.OUTPUT_CHANNEL_ID,
-                        photo=path,
-                        caption=caption,
-                    )
-                else:
-                    await client.send_message(Config.OUTPUT_CHANNEL_ID, text=caption)
-            finally:
-                if path:
-                    _safe_remove(path)
-
-        elif message.video:
-            path = await client.download_media(
-                message,
-                file_name=os.path.join(DOWNLOAD_DIR, f"video_{message.id}.mp4"),
-            )
-            try:
-                if path:
-                    await client.send_video(
-                        chat_id=Config.OUTPUT_CHANNEL_ID,
-                        video=path,
-                        caption=caption,
-                    )
-                else:
-                    await client.send_message(Config.OUTPUT_CHANNEL_ID, text=caption)
-            finally:
-                if path:
-                    _safe_remove(path)
-
-        elif message.animation:
-            path = await client.download_media(
-                message,
-                file_name=os.path.join(DOWNLOAD_DIR, f"gif_{message.id}.mp4"),
-            )
-            try:
-                if path:
-                    await client.send_animation(
-                        chat_id=Config.OUTPUT_CHANNEL_ID,
-                        animation=path,
-                        caption=caption,
-                    )
-                else:
-                    await client.send_message(Config.OUTPUT_CHANNEL_ID, text=caption)
-            finally:
-                if path:
-                    _safe_remove(path)
-
-        else:
-            # Text-only message
-            await client.send_message(Config.OUTPUT_CHANNEL_ID, text=caption)
-
-        logger.info(f"✅ Posted message {message.id} to output channel")
-
-    except FloodWait as e:
-        logger.warning(f"FloodWait: sleeping {e.value}s")
-        await asyncio.sleep(e.value)
-    except Exception as e:
-        logger.error(f"Failed to post message {message.id}: {e}", exc_info=True)
-
-
-def _safe_remove(path: str):
-    """Delete a temp file, ignoring errors."""
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -180,26 +122,27 @@ def _safe_remove(path: str):
 # ---------------------------------------------------------------------------
 async def process_message(client: Client, message):
     """
-    1. Extract URLs from the message
-    2. Resolve shortened URLs and extract product IDs
-    3. Send payload to n8n webhook
-    4. If n8n says "post" → re-post with affiliate links
+    Pipeline:
+    1. Extract URLs from text + Telegram entities (hidden hyperlinks)
+    2. Filter to known product/shortener domains
+    3. Resolve first URL → canonical product URL + product_id
+    4. Layer 1 check: BoundedSet (O(1), resets on restart)
+    5. Fire n8n webhook {product_id, urls, caption, channel, message_id}
+       → n8n: Layer 2 (Sheets) → Wishlink API → copyMessage → log
     """
     try:
         channel_id = message.chat.id
+        source_channel = getattr(message.chat, "title", "Unknown")
 
-        # Skip already-processed messages
-        if message.id <= last_message_ids.get(channel_id, 0):
-            return
-
-        # Get text content
+        # --- Text content ---
         text = message.caption or message.text or ""
         if not text:
-            last_message_ids[channel_id] = message.id
             return
 
-        # Extract URLs from text AND entities (handles hidden hyperlinks)
+        # --- Extract URLs from text ---
         all_urls = url_resolver.extract_urls(text)
+
+        # --- Also extract from entities (handles invisible hyperlinks) ---
         entities = message.caption_entities or message.entities or []
         for entity in entities:
             if entity.type == MessageEntityType.TEXT_LINK and entity.url:
@@ -211,77 +154,96 @@ async def process_message(client: Client, message):
                     all_urls.append(url_text)
 
         if not all_urls:
-            last_message_ids[channel_id] = message.id
             return
 
-        # Filter to product URLs only
+        # --- Filter to known product/shortener domains ---
         product_urls = [u for u in all_urls if url_resolver.is_product_url(u)]
         if not product_urls:
-            last_message_ids[channel_id] = message.id
             return
 
-        # Resolve and extract product IDs (blocking I/O → run in executor)
+        # --- Process FIRST product URL only ---
+        # Design decision: 1 Wishlink call per deal → avoids rate limits
         loop = asyncio.get_running_loop()
-        processed_links = []
-        for url in product_urls:
-            result = await loop.run_in_executor(None, url_resolver.process_url, url)
-            processed_links.append(result)
-
-        if not processed_links:
-            last_message_ids[channel_id] = message.id
-            return
-
-        # Build payload for n8n
-        payload = {
-            "links": processed_links,
-            "caption": text,
-            "has_photo": bool(message.photo),
-            "has_video": bool(message.video),
-            "source_channel": getattr(message.chat, "title", "Unknown"),
-            "source_channel_id": channel_id,
-            "message_id": message.id,
-        }
-
-        source = payload["source_channel"]
-        logger.info(
-            f"📤 [{source}] Sending {len(processed_links)} link(s) to n8n"
+        first_result = await loop.run_in_executor(
+            None, url_resolver.process_url, product_urls[0]
         )
 
-        # Call n8n
-        response = await call_n8n_webhook(payload)
-        if not response:
+        product_id = first_result.get("product_id", "")
+        if not product_id:
             return
 
-        action = response.get("action", "skip")
-        if action == "skip":
-            logger.info(f"⏭️  Skipped (duplicate): msg {message.id}")
-            last_message_ids[channel_id] = message.id
+        # --- Layer 1: In-memory O(1) duplicate check ---
+        if product_id in seen_product_ids:
+            logger.info(f"⏭️  Layer 1 skip (in-memory): {product_id}")
             return
 
-        affiliate_links = response.get("affiliate_links", {})
-        if not affiliate_links:
-            logger.warning(f"No affiliate links returned for msg {message.id}")
-            last_message_ids[channel_id] = message.id
-            return
+        # Mark as seen before webhook
+        # Tradeoff: if webhook fails, deal is missed until restart (deque cleared)
+        # Layer 2 (Sheets) handles cross-restart dedup
+        seen_product_ids.add(product_id)
 
-        # Post to output channel
-        await post_to_channel(client, message, affiliate_links)
+        # --- Build n8n payload ---
+        payload = {
+            "product_id":        product_id,
+            "original_url":      first_result.get("original_url", ""),
+            "resolved_url":      first_result.get("resolved_url", ""),
+            "platform":          first_result.get("platform", "unknown"),
+            "caption":           text,
+            "source_channel":    source_channel,
+            "source_channel_id": channel_id,
+            "message_id":        message.id,
+        }
 
-        # Rate-limit delay
-        await asyncio.sleep(Config.POST_DELAY)
+        logger.info(
+            f"📤 [{source_channel}] Firing n8n: {product_id} | "
+            f"platform={first_result.get('platform')} | msg {message.id}"
+        )
 
-        # Mark successfully processed!
-        last_message_ids[channel_id] = message.id
+        await fire_n8n_webhook(payload)
 
     except Exception as e:
         logger.error(f"Error processing msg {message.id}: {e}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
+# Queue worker — ONE message at a time
+# Natural gap = n8n processing time (~3-5s) + POST_DELAY
+# Wishlink rate limit: 5 calls/batch, 120s cooldown
+# Our rate: ~1 call per (3+3)=6s → well within limits
+# ---------------------------------------------------------------------------
+async def queue_worker(client: Client):
+    """Consume _message_queue sequentially. Never processes 2 messages at once."""
+    logger.info("✅ Queue worker started")
+    while True:
+        message = await _message_queue.get()
+        try:
+            await process_message(client, message)
+            await asyncio.sleep(Config.POST_DELAY)
+        except Exception as e:
+            logger.error(f"Queue worker error on msg {message.id}: {e}", exc_info=True)
+        finally:
+            # Always mark task done — even on exception
+            _message_queue.task_done()
+
+
+def _on_worker_done(task: asyncio.Task):
+    """Callback: log if worker task dies unexpectedly."""
+    if not task.cancelled():
+        exc = task.exception()
+        if exc:
+            logger.critical(
+                f"❌ Queue worker task died unexpectedly: {exc}",
+                exc_info=exc
+            )
+
+
+# ---------------------------------------------------------------------------
 # Pyrogram bot runner
 # ---------------------------------------------------------------------------
 async def run_bot():
-    """Start the Pyrogram userbot, register handlers, run polling backup."""
+    """Start Pyrogram userbot, register handlers, launch queue worker and polling."""
+    global _message_queue, _worker_task
+    _message_queue = asyncio.Queue()
 
     client = Client(
         name=":memory:",
@@ -292,30 +254,28 @@ async def run_bot():
         in_memory=True,
     )
 
-    # ---- Real-time message handler ----
+    # ---- Real-time handler: ONLY adds to queue (instant, non-blocking) ----
     channel_filter = filters.chat(Config.CHANNELS)
 
     @client.on_message(channel_filter)
     async def on_channel_message(_client, message):
-        await process_message(_client, message)
+        await _message_queue.put(message)
+        logger.info(
+            f"📥 Queued msg {message.id} from "
+            f"'{getattr(message.chat, 'title', 'Unknown')}' "
+            f"(queue depth: {_message_queue.qsize()})"
+        )
 
     # ---- Start client ----
     await client.start()
     logger.info(f"✅ Pyrogram started — monitoring {len(Config.CHANNELS)} channels")
 
-    # ---- Set starting points (skip old messages) ----
-    for ch_id in Config.CHANNELS:
-        try:
-            async for msg in client.get_chat_history(ch_id, limit=1):
-                last_message_ids[ch_id] = msg.id
-                logger.info(f"   Channel {ch_id}: starting from msg {msg.id}")
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"   Channel {ch_id}: could not set start point — {e}")
+    # ---- Launch queue worker — store reference to detect crashes ----
+    _worker_task = asyncio.create_task(queue_worker(client), name="queue-worker")
+    _worker_task.add_done_callback(_on_worker_done)
+    logger.info("✅ Queue worker task launched")
 
-    logger.info("✅ Starting points set. Real-time monitoring active.")
-
-    # ---- Polling backup loop ----
+    # ---- Polling backup loop (catches messages missed during real-time gaps) ----
     while True:
         try:
             await asyncio.sleep(Config.POLLING_INTERVAL)
@@ -328,16 +288,30 @@ async def run_bot():
                         ch_id, limit=Config.POLLING_LIMIT
                     ):
                         msgs.append(msg)
-                    
-                    # Reverse so oldest in the polled batch gets processed first
+
+                    # Oldest first → natural order
                     msgs.reverse()
                     for msg in msgs:
-                        await process_message(client, msg)
+                        text = msg.caption or msg.text or ""
+                        if text:
+                            # Queue it — deque check inside process_message
+                            # will skip if already processed in real-time
+                            await _message_queue.put(msg)
+
                 except FloodWait as e:
-                    logger.warning(f"FloodWait on poll for {ch_id}: {e.value}s")
-                    await asyncio.sleep(e.value)
+                    # Cap wait and skip this channel this cycle
+                    # (don't block all other channels)
+                    wait_time = min(e.value, 30)
+                    logger.warning(
+                        f"FloodWait on poll for {ch_id}: sleeping {wait_time}s "
+                        f"(full wait was {e.value}s) — skipping channel this cycle"
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+
                 except Exception as e:
                     logger.warning(f"Poll error for {ch_id}: {e}")
+
                 await asyncio.sleep(1)
 
             logger.info("🔄 Polling cycle done")
@@ -348,16 +322,15 @@ async def run_bot():
 
 
 def _run_bot_thread():
-    """Run the async bot inside a dedicated thread with its own event loop."""
+    """Run async bot in a dedicated thread with its own event loop."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(run_bot())
 
 
 # ---------------------------------------------------------------------------
-# Start the bot thread on module import — required for Gunicorn
-# (Gunicorn imports bot:flask_app, so __main__ block never runs)
-# Using BOT_STARTED guard to prevent multiple threads if Gunicorn tries multiple times
+# Auto-start on module import — required for Gunicorn
+# BOT_STARTED guard prevents duplicate threads across Gunicorn workers
 # ---------------------------------------------------------------------------
 if os.environ.get("BOT_STARTED") != "1":
     os.environ["BOT_STARTED"] = "1"
@@ -368,7 +341,7 @@ if os.environ.get("BOT_STARTED") != "1":
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint (local development only)
+# Local development entrypoint only
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     flask_app.run(host="0.0.0.0", port=Config.PORT)

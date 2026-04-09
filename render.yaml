@@ -13,8 +13,6 @@ services:
         sync: false
       - key: CHANNELS
         sync: false
-      - key: OUTPUT_CHANNEL_ID
-        sync: false
       - key: N8N_WEBHOOK_URL
         sync: false
       - key: POST_DELAY

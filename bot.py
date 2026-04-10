@@ -257,16 +257,20 @@ async def run_bot():
     )
 
     # ---- Real-time handler: ONLY adds to queue (instant, non-blocking) ----
-    channel_filter = filters.chat(Config.CHANNELS)
+    # Using filters.channel + manual ID check instead of filters.chat(ids)
+    # reason: filters.chat() with in-memory session can silently miss messages
+    # when peers aren't cached yet at startup
+    channels_set = set(Config.CHANNELS)
 
-    @client.on_message(channel_filter)
+    @client.on_message(filters.channel)
     async def on_channel_message(_client, message):
-        await _message_queue.put(message)
-        logger.info(
-            f"📥 Queued msg {message.id} from "
-            f"'{getattr(message.chat, 'title', 'Unknown')}' "
-            f"(queue depth: {_message_queue.qsize()})"
-        )
+        if message.chat and message.chat.id in channels_set:
+            await _message_queue.put(message)
+            logger.info(
+                f"📥 Queued msg {message.id} from "
+                f"'{getattr(message.chat, 'title', 'Unknown')}' "
+                f"(queue depth: {_message_queue.qsize()})"
+            )
 
     # ---- Start client ----
     await client.start()
